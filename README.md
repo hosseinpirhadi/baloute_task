@@ -62,6 +62,10 @@ The problem statement intentionally left several requirements ambiguous to allow
 * **Impact on Restart Behavior**: If a TaskManager crashes, Flink wakes up and restores exactly from the last 10-second checkpoint. The Kafka consumer offsets and the internal Flink state (deduplicated IDs and user counts) are rolled back together in sync. 
 * **Impact on Accuracy**: Because the deduplication state is restored alongside the Kafka offsets, any Kafka messages that are re-read during recovery will simply hit the deduplication filter. This guarantees **Exactly-Once Semantics (no double counting)** across failure boundaries.
 
+### 8. Data Quality & Format
+* **Task Ambiguity**: Is the incoming data guaranteed to be well-formed, or can it be malformed?
+* **Our Assumption**: We assume that all JSON data arriving at the Kafka topic is structurally correct and contains the necessary fields. However, recognizing that in production systems bad data *will* inevitably arrive, we still implemented a **Dead-Letter Queue (DLQ)** pattern using Side Outputs. This gracefully catches any malformed records and prevents the entire job from crashing into a restart loop.
+
 ### Demo Configuration vs. Production Specification
 
 The official problem statement specifies:
