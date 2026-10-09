@@ -15,6 +15,8 @@ Remove duplicates by `event_id`, then, for every one-hour event-time window, rep
 Python Producer (Container) -> Kafka -> Flink Kafka Source -> event-time watermarks -> deduplication by `event_id`
 -> 1-hour tumbling event-time window -> count per user -> Top 10 -> stdout
 
+![Flink Job Dashboard](flink-dashboard.png)
+
 Flink Web UI: http://localhost:8081
 
 ## Deliberate Assumptions & Trade-offs
