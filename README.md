@@ -12,14 +12,14 @@ Remove duplicates by `event_id`, then, for every one-hour event-time window, rep
 
 ## Architecture
 
-Kafka -> Flink Kafka Source -> event-time watermarks -> deduplication by `event_id`
+Python Producer (Container) -> Kafka -> Flink Kafka Source -> event-time watermarks -> deduplication by `event_id`
 -> 1-hour tumbling event-time window -> count per user -> Top 10 -> stdout
 
 Flink Web UI: http://localhost:8081
 
 ## Deliberate assumptions
 
-1. **Source**: Kafka is used rather than a file because the task is a streaming-processing exercise.
+1. **Source**: Kafka is used rather than a file because the task is a streaming-processing exercise. Events are ingested into Kafka via an automated Python producer container.
 2. **Timestamp**: `timestamp` is the event timestamp and is used as Event Time.
 3. **Window**: a fixed 1-hour Tumbling Event-Time Window is used. Windows do not overlap.
 4. **Out-of-order events**: watermarks allow 5 minutes of out-of-orderness.
@@ -63,23 +63,46 @@ Requirements:
 - Internet access for the first image/Maven build
 
 
-Start Kafka and Flink:
+Start the pipeline (Kafka, Flink, and the Python producer):
 
 ```bash
 docker compose up -d --build
 ```
+
+This starts:
+- `kafka`: Kafka broker (`localhost:9092`)
+- `kafka-init`: creates the `events` topic (3 partitions)
+- `jobmanager` & `taskmanager`: Flink cluster (`http://localhost:8081`)
+- `submit`: submits the compiled Flink job to the cluster
+- `kafka-producer`: Python producer service that automatically publishes events
 
 Open:
 
 - Kafka: `localhost:9092`
 - Flink UI: `http://localhost:8081`
 
-## Produce test events
+## Event Producer
 
-After the containers are running:
+The project includes an automated Python producer container (`kafka-producer` under `producer/`) that starts automatically with `docker compose up`. It generates and publishes random JSON events to the `events` topic every 2 seconds.
+
+To monitor the Python producer logs:
 
 ```bash
-docker exec -it kafka /opt/kafka/bin/kafka-console-producer.sh   --bootstrap-server kafka:9092   --topic events
+docker logs -f kafka-producer
+```
+
+To see the Flink job output (Top 10 users printed to stdout):
+
+```bash
+docker logs -f flink-taskmanager
+```
+
+### Manual test events (optional)
+
+If you want to manually inject specific events or test deduplication scenarios:
+
+```bash
+docker exec -it kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9092 --topic events
 ```
 
 Paste JSON events such as:
@@ -91,13 +114,7 @@ Paste JSON events such as:
 {"event_id":"1","user_id":"alice","timestamp":"2026-10-08T10:05:00+00:00"}
 ```
 
-The last event is a duplicate and should not increase Alice's count.
-
-To see job output:
-
-```bash
-docker logs -f flink-taskmanager
-```
+The duplicate event (`event_id: "1"`) will be filtered out by the deduplication step and will not increment Alice's count.
 
 ## Stop
 
