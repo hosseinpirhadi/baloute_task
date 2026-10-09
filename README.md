@@ -62,11 +62,6 @@ Requirements:
 - Docker Compose
 - Internet access for the first image/Maven build
 
-Build the Java job:
-
-```bash
-mvn clean package
-```
 
 Start Kafka and Flink:
 
