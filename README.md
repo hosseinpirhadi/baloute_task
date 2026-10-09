@@ -17,42 +17,81 @@ Python Producer (Container) -> Kafka -> Flink Kafka Source -> event-time waterma
 
 Flink Web UI: http://localhost:8081
 
-## Deliberate assumptions
+## Deliberate Assumptions & Trade-offs
 
-1. **Source**: Kafka is used rather than a file because the task is a streaming-processing exercise. Events are ingested into Kafka via an automated Python producer container.
-2. **Timestamp**: `timestamp` is the event timestamp and is used as Event Time.
-3. **Window**: a fixed 1-hour Tumbling Event-Time Window is used. Windows do not overlap.
-4. **Out-of-order events**: watermarks allow 5 minutes of out-of-orderness.
-5. **Late events**: events arriving later than the watermark are not deliberately reprocessed in this implementation. The README explicitly chooses bounded lateness to keep latency predictable.
-6. **Deduplication horizon**: `event_id` state has a 24-hour TTL. Therefore, duplicates arriving within 24 hours are removed. An event repeated after the TTL is not guaranteed to be recognized as a duplicate. This is a deliberate memory/correctness trade-off.
-7. **Tie-breaking**: if two users have the same count, `user_id` is used lexicographically as a deterministic tie-breaker.
-8. **Output semantics**: the downstream Top-10 operator collects all per-user results for a window and emits one final Top-10 when the event-time watermark reaches the window end.
-9. **Restart**: Flink checkpointing is enabled every 10 seconds with EXACTLY_ONCE mode. Kafka offsets and Flink operator state are recovered from checkpoints.
-10. **Parallelism**: the job uses parallelism 3. Deduplication is keyed by `event_id`, so the same event ID is routed to the same keyed state partition.
+The problem statement intentionally left several requirements ambiguous to allow for architectural decision-making. Below is a breakdown of the assumptions made, the possible alternatives, and the rationale behind our choices, specifically analyzing their impact on **Data Latency**, **Counting Accuracy**, **Memory**, and **Restart Behavior**:
 
-## Important trade-offs
+### 1. Data Source (File vs. Kafka)
+* **Task Ambiguity**: The task says to "read event records from a file or Kafka".
+* **Our Choice**: **Apache Kafka**.
+* **Rationale**: This is fundamentally a Stream Processing problem. Kafka allows us to simulate a continuous, real-world stream of events, demonstrating how to handle network delays, out-of-order data, and distributed offset commits.
 
-### Latency
+### 2. Time Semantics (Timestamp)
+* **Task Ambiguity**: Each JSON record has a `timestamp`, but it is not specified whether windows should be evaluated based on the server's clock or the event's embedded timestamp.
+* **Our Choice**: **Event Time**.
+* **Impact on Accuracy & Latency**: Event Time significantly increases **Counting Accuracy**. If the network goes down and events arrive hours late, they will still be grouped into their correct historical 1-hour window. However, this increases **Data Latency**, as Flink must wait for Watermarks to ensure no older data is still on the way before closing the window.
 
-The 5-minute watermark delay means a window is normally finalized only after Flink believes it has seen events up to the end of that window plus the allowed out-of-orderness. This increases latency but gives late/out-of-order events a chance to be included.
+### 3. Windowing Strategy
+* **Task Ambiguity**: "For each 1-hour window" could mean fixed non-overlapping windows or sliding windows.
+* **Our Choice**: **Tumbling Event-Time Windows** (configurable via the `WINDOW_SIZE_MINUTES` environment variable).
 
-### Counting accuracy
+### 4. Out-of-Orderness & Lateness
+* **Task Ambiguity**: In the real world, data arrives out of order. How long should the job wait for delayed events?
+* **Our Choice**: A **5-minute Watermark Delay** threshold (configurable via environment variables).
+* **Impact on Latency**: The output for any 1-hour window is deliberately delayed and emitted **5 minutes after the window closes**. This latency is traded for **Accuracy** so that slightly delayed network events are still counted. Any events arriving later than this 5-minute threshold (Late Events) are entirely dropped.
 
-The count is based on unique `event_id`s. The 24-hour TTL means the guarantee is bounded: duplicates older than 24 hours can be counted again.
+### 5. Deduplication Scope & Memory Management
+* **Task Ambiguity**: "Remove duplicate records based on `event_id`." Should this deduplication happen only within the current 1-hour window, or globally across the lifetime of the application?
+* **Our Choice**: We maintain the `event_id`s in Flink's State (`ValueState`) with a **24-hour TTL (Time-To-Live)**.
+* **Impact on Memory**: If state were kept forever, the server's memory (RAM/RocksDB) would eventually explode (OOM) as millions of unique IDs pile up. The 24-hour TTL ensures **Memory remains bounded and stable**.
+* **Impact on Accuracy**: Guarantees that if a duplicate event arrives 20 hours later, it will still be successfully filtered out and not counted twice.
 
-Using Event Time instead of Processing Time means events are assigned to windows according to their event timestamps, which is usually more correct for business events.
+### 6. Top 10 Processing & Tie-Breaking
+* **Task Ambiguity**: How should we efficiently find the Top 10 users among millions? And if two users have the same count, who gets prioritized?
+* **Our Choice**: 
+  - We use an `AggregateFunction` to keep only a single rolling integer (count) per user during the window, rather than buffering raw events.
+  - When the window closes, we process the counts using a **Min-Heap (PriorityQueue) bounded to a size of exactly 10**. 
+  - **Tie-Breaking**: If users have identical event counts, we fall back to sorting by `user_id` lexicographically (alphabetically). This guarantees the Top 10 output is always **Deterministic** and reproducible.
+* **Impact on Memory & CPU**: Drastically reduces memory consumption during the window and optimizes the CPU sorting overhead down to `O(N log 10)`.
 
-### Memory
+### 7. Restart Behavior & Fault Tolerance
+* **Task Ambiguity**: What happens if the server crashes? Will records be double-counted upon restart?
+* **Our Choice**: Enabled **Checkpointing every 10 seconds** with the **`EXACTLY_ONCE`** mode using the RocksDB state backend.
+* **Impact on Restart Behavior**: If a TaskManager crashes, Flink wakes up and restores exactly from the last 10-second checkpoint. The Kafka consumer offsets and the internal Flink state (deduplicated IDs and user counts) are rolled back together in sync. 
+* **Impact on Accuracy**: Because the deduplication state is restored alongside the Kafka offsets, any Kafka messages that are re-read during recovery will simply hit the deduplication filter. This guarantees **Exactly-Once Semantics (no double counting)** across failure boundaries.
 
-Deduplication requires state keyed by `event_id`. Without a TTL, that state can grow indefinitely. The 24-hour TTL bounds its lifetime.
+### Demo Configuration vs. Production Specification
 
-The Top-10 stage keeps per-user counts for each active window. For very high cardinality, this can become large. A production implementation could use a more scalable aggregation design and/or RocksDB-backed state.
+The official problem statement specifies:
+- **Window size**: 1-hour tumbling window
+- **Watermark delay (out-of-orderness allowance)**: 5 minutes
 
-### Restart
+For rapid local testing and demonstration, the code currently runs with shortened parameters via `docker-compose.yml` so window evaluations appear in real time:
+- **Window size**: 1 minute
+- **Watermark delay**: 5 seconds
 
-Checkpoints persist operator state and Kafka source progress. After a failure, Flink can restore state and continue from the checkpoint rather than starting from scratch.
+To switch back to the official production settings (1-hour window, 5-minute watermark delay), you have two options in `docker-compose.yml` under the `submit` container environment:
 
-The checkpoint interval is 10 seconds, so a failure can cause roughly up to the most recent checkpoint interval of processing progress to be replayed, subject to source/connector and checkpoint completion behavior. Stateful deduplication prevents replayed events from being counted twice after state recovery.
+**Option 1: Update the values explicitly**
+```yaml
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: events
+      WINDOW_SIZE_MINUTES: 60
+      MAX_OUT_OF_ORDERNESS_SECONDS: 300
+```
+
+**Option 2: Delete them (Recommended)**
+Since the Java code defaults to 60 minutes and 300 seconds automatically, you can simply delete or comment out those two lines:
+```yaml
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: events
+      # WINDOW_SIZE_MINUTES: 1
+      # MAX_OUT_OF_ORDERNESS_SECONDS: 5
+```
+
+After modifying `docker-compose.yml`, run `docker compose up -d` to apply the changes.
 
 ## Build and run
 
@@ -96,25 +135,6 @@ To see the Flink job output (Top 10 users printed to stdout):
 ```bash
 docker logs -f flink-taskmanager
 ```
-
-### Manual test events (optional)
-
-If you want to manually inject specific events or test deduplication scenarios:
-
-```bash
-docker exec -it kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9092 --topic events
-```
-
-Paste JSON events such as:
-
-```json
-{"event_id":"1","user_id":"alice","timestamp":"2026-10-08T10:05:00+00:00"}
-{"event_id":"2","user_id":"bob","timestamp":"2026-10-08T10:10:00+00:00"}
-{"event_id":"3","user_id":"alice","timestamp":"2026-10-08T10:20:00+00:00"}
-{"event_id":"1","user_id":"alice","timestamp":"2026-10-08T10:05:00+00:00"}
-```
-
-The duplicate event (`event_id: "1"`) will be filtered out by the deduplication step and will not increment Alice's count.
 
 ## Stop
 

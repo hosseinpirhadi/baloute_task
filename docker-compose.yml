@@ -85,6 +85,8 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC: events
+      WINDOW_SIZE_MINUTES: 1
+      MAX_OUT_OF_ORDERNESS_SECONDS: 5
     networks: [streaming]
 
   kafka-producer:
